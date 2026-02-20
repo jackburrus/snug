@@ -38,7 +38,7 @@ export function buildStats(
     totalTokens,
     budget,
     utilization: budget > 0 ? totalTokens / budget : 0,
-    estimatedCost: estimateCost(totalTokens, config.model),
+    estimatedCost: estimateCost(totalTokens, config.model, config.pricing),
     breakdown,
   };
 }

@@ -3,7 +3,7 @@
 Fit the right context into your LLM's window.
 
 ```
-npm install snug
+npm install snug-ai
 ```
 
 snug takes everything you want in your LLM's context — system prompts, tools, conversation history, memory, RAG chunks — and packs it into an optimally arranged context window with full visibility into what was included, what was dropped, and why.
@@ -22,7 +22,7 @@ Bigger context windows don't solve this. The problem is architectural. snug help
 ## Quick Start
 
 ```typescript
-import { ContextOptimizer } from 'snug';
+import { ContextOptimizer } from 'snug-ai';
 
 const optimizer = new ContextOptimizer({
   model: 'claude-sonnet-4-20250514',
@@ -33,6 +33,7 @@ const optimizer = new ContextOptimizer({
 // Register your context sources
 optimizer.add('system', 'You are a helpful coding assistant.', {
   priority: 'required',
+  position: 'beginning',
 });
 
 optimizer.add('tools', [
@@ -43,6 +44,8 @@ optimizer.add('tools', [
 optimizer.add('history', conversationMessages, {
   priority: 'high',
   keepLast: 3,
+  dropStrategy: 'oldest',
+  position: 'end',
 });
 
 optimizer.add('memory', memoryResults, { priority: 'medium' });
@@ -76,7 +79,7 @@ result.stats = {
   totalTokens: 47832,
   budget: 191808,
   utilization: 0.249,
-  estimatedCost: { input: '$0.1435', provider: 'anthropic' },
+  estimatedCost: { input: '$0.1435', provider: 'anthropic' }, // requires pricing config
   breakdown: {
     system: { tokens: 12, items: 1 },
     tools: { tokens: 156, items: 2, dropped: 1, reason: 'budget exhausted' },
@@ -98,6 +101,7 @@ const optimizer = new ContextOptimizer({
   contextWindow: 200_000,             // Total tokens available
   reserveOutput: 8_192,               // Reserved for model output (default: 4096)
   tokenizer: myTokenizer,             // Optional: { count(text: string): number }
+  pricing: { inputPer1M: 3 },         // Optional: override built-in cost table
 });
 ```
 
@@ -106,9 +110,9 @@ const optimizer = new ContextOptimizer({
 Register a context source. Arrays are split into independently-scored items. Objects are JSON-stringified. Calling `add()` with the same source name replaces the previous registration.
 
 ```typescript
-optimizer.add('system', systemPrompt, { priority: 'required' });
+optimizer.add('system', systemPrompt, { priority: 'required', position: 'beginning' });
 optimizer.add('tools', toolDefinitions, { priority: 'high' });
-optimizer.add('history', messages, { priority: 'high', keepLast: 3 });
+optimizer.add('history', messages, { priority: 'high', keepLast: 3, dropStrategy: 'oldest', position: 'end' });
 optimizer.add('memory', memoryResults, { priority: 'medium' });
 optimizer.add('rag', ragChunks, { priority: 'medium' });
 ```
@@ -118,11 +122,12 @@ optimizer.add('rag', ragChunks, { priority: 'medium' });
 | Option | Type | Description |
 |--------|------|-------------|
 | `priority` | `'required' \| 'high' \| 'medium' \| 'low'` | Priority tier. Required items are always included. |
+| `position` | `'beginning' \| 'end'` | Pin items to the start or end of the context. Unpinned items float (edges-first by score). |
 | `keepLast` | `number` | Promote the last N items to required (useful for recent history). |
+| `dropStrategy` | `'relevance' \| 'oldest' \| 'none'` | `'relevance'`: drop lowest-scored first. `'oldest'`: drop oldest first (recency bias). `'none'`: never drop. |
+| `groupBy` | `'turn'` | Group messages into conversation turns. A new turn starts at each `role: 'user'` message. Turns are packed/dropped atomically. `keepLast` counts turns. |
 | `scorer` | `(item, query) => number` | Custom scoring function. Overrides priority-based scoring. |
 | `requires` | `Record<string, string>` | Dependency constraints: if item A is included, item B must be too. |
-| `dropStrategy` | `'relevance' \| 'oldest' \| 'none'` | How to handle items that don't fit. |
-| `compressStrategy` | `'truncate' \| 'summarize-oldest' \| 'none'` | How to compress items. |
 
 ### `optimizer.pack(query?)`
 
@@ -151,14 +156,55 @@ Items are scored by tier: `required` (always included) > `high` (100) > `medium`
 
 ### Recency Bias
 
-History sources automatically apply recency weighting. Oldest messages are decayed to 10% of their base score; newest messages retain full score. Combined with `keepLast`, this ensures recent conversation is preserved while old messages are dropped first when budget is tight.
+Sources with `dropStrategy: 'oldest'` automatically apply recency weighting. Oldest items are decayed to 10% of their base score; newest items retain full score. Combined with `keepLast`, this ensures recent conversation is preserved while old messages are dropped first when budget is tight.
 
 ### Lost-in-the-Middle Placement
 
 After packing, items are rearranged to exploit the U-shaped attention curve:
-- System prompt and high-scoring items at the **beginning**
-- Recent history and the query at the **end**
-- Lower-scoring items in the **middle**
+- Items with `position: 'beginning'` are pinned at the **start** (primacy)
+- Items with `position: 'end'` are pinned at the **end** (recency)
+- Floating items (no position) are arranged edges-first: highest-scored at the beginning and end, lowest-scored in the **middle** where LLM attention is weakest
+
+### Conversation History
+
+Use `groupBy: 'turn'` to pack conversation history as atomic turns instead of individual messages. A turn starts at each `role: 'user'` message and includes everything until the next user message (assistant replies, tool calls, tool results).
+
+```typescript
+optimizer.add('history', [
+  { role: 'user', content: 'Help with auth' },
+  { role: 'assistant', content: 'Looking at the code...' },
+  { role: 'user', content: 'Fix the session bug' },
+  { role: 'assistant', content: 'Found the issue...' },
+], {
+  priority: 'high',
+  keepLast: 1,          // last 1 turn is required (not message)
+  dropStrategy: 'oldest',
+  position: 'end',
+  groupBy: 'turn',      // group into conversation turns
+});
+```
+
+With `groupBy: 'turn'`:
+- Each turn is packed/dropped as a single unit — no orphaned tool calls or split conversations
+- `keepLast` counts turns, not messages
+- Recency bias applies at the turn level
+- Each turn's `value` contains the original message array, making it easy to reconstruct API messages:
+
+```typescript
+for (const item of result.items) {
+  if (item.source === 'history') {
+    for (const msg of item.value as any[]) {
+      apiMessages.push({ role: msg.role, content: msg.content });
+    }
+  }
+}
+```
+
+Items without `role` fields are left ungrouped — `groupBy: 'turn'` is a no-op for plain strings or objects without roles.
+
+### Role Preservation
+
+snug extracts the `role` field from input objects and carries it through to `PackedItem.role`. This means output items are directly usable for LLM API message construction without needing to infer roles from source names.
 
 ### Dependency Constraints
 
@@ -200,11 +246,21 @@ snug detects common context engineering mistakes:
 
 ### Cost Estimation
 
-Built-in pricing for Anthropic, OpenAI, and Google models. Returns estimated input cost per `pack()` call.
+Pass your model's pricing to get per-call cost estimates in `result.stats.estimatedCost`:
+
+```typescript
+const optimizer = new ContextOptimizer({
+  model: 'claude-sonnet-4-20250514',
+  contextWindow: 200_000,
+  pricing: { inputPer1M: 3, provider: 'anthropic' },
+});
+```
+
+Without `pricing`, `estimatedCost` is `undefined`.
 
 ### Custom Tokenizer
 
-The built-in heuristic is fast but approximate. For exact counts, bring your own tokenizer:
+The built-in heuristic is fast but approximate (~10-15% over-estimation, which is conservative/safe — it will never exceed your budget). It smoothly interpolates between 4 chars/token for prose and 3 chars/token for code/JSON based on structural character density. For exact counts, bring your own tokenizer:
 
 ```typescript
 import { encoding_for_model } from 'tiktoken';
@@ -216,6 +272,51 @@ const optimizer = new ContextOptimizer({
   tokenizer: { count: (text) => enc.encode(text).length },
 });
 ```
+
+## Usage with Providers
+
+snug gives you packed, ordered content — here's how to feed it to your LLM:
+
+### Anthropic (Claude)
+
+```typescript
+import Anthropic from '@anthropic-ai/sdk';
+
+const result = optimizer.pack('Refactor the auth module');
+
+const systemItems = result.items.filter(i => i.source === 'system');
+const messageItems = result.items.filter(i => i.source !== 'system');
+
+const response = await new Anthropic().messages.create({
+  model: 'claude-sonnet-4-20250514',
+  max_tokens: 8192,
+  system: systemItems.map(i => i.content).join('\n'),
+  messages: messageItems.map(i => ({
+    role: i.role === 'assistant' ? 'assistant' as const : 'user' as const,
+    content: i.content,
+  })),
+});
+```
+
+### OpenAI
+
+```typescript
+import OpenAI from 'openai';
+
+const result = optimizer.pack('Refactor the auth module');
+
+const messages = result.items.map(i => ({
+  role: i.role ?? (i.source === 'system' ? 'system' as const : 'user' as const),
+  content: i.content,
+}));
+
+const response = await new OpenAI().chat.completions.create({
+  model: 'gpt-4o',
+  messages,
+});
+```
+
+The exact mapping depends on your application — snug is intentionally provider-agnostic. Use the `source`, `role`, `placement`, and `value` fields on each `PackedItem` to build whatever message format your provider expects.
 
 ## Item IDs
 

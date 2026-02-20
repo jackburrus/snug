@@ -4,7 +4,6 @@ export { ContextOptimizer } from './optimizer';
 export type {
   Priority,
   DropStrategy,
-  CompressStrategy,
   Placement,
   Tokenizer,
   OptimizerConfig,

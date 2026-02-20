@@ -6,51 +6,50 @@ import type { ContextItem, PackedItem, Placement } from '../types';
  * LLMs attend most to the beginning and end of the context window.
  * This function arranges items to exploit that:
  *
- * - **System prompt** → always first (primacy)
- * - **Query** → always last (recency)
- * - **History** → near the end, in original order (recency + temporal coherence)
- * - **Everything else** (tools, memory, RAG) → edges-first placement:
- *   highest-scored items alternate between beginning and end positions,
- *   pushing lower-scored items toward the middle.
+ * - Items with `position: 'beginning'` → pinned at the start (primacy)
+ * - Items with `position: 'end'` → pinned at the end (recency)
+ * - Floating items (no position) → edges-first by score:
+ *   highest-scored items alternate between beginning and end,
+ *   pushing lower-scored items toward the middle where attention is weakest.
  */
 export function applyPlacement(items: ContextItem[]): PackedItem[] {
-  const system: ContextItem[] = [];
+  const pinStart: ContextItem[] = [];
+  const pinEnd: ContextItem[] = [];
   const query: ContextItem[] = [];
-  const history: ContextItem[] = [];
-  const rest: ContextItem[] = [];
+  const float: ContextItem[] = [];
 
   for (const item of items) {
-    if (item.source === 'system') system.push(item);
-    else if (item.source === 'query') query.push(item);
-    else if (item.source === 'history') history.push(item);
-    else rest.push(item);
+    // Query is internal — always the very last item
+    if (item.source === 'query') query.push(item);
+    else if (item.position === 'beginning') pinStart.push(item);
+    else if (item.position === 'end') pinEnd.push(item);
+    else float.push(item);
   }
 
-  // Sort history by original index (preserve temporal order)
-  history.sort((a, b) => a.index - b.index);
+  // Pinned items preserve their original source order
+  pinStart.sort((a, b) => a.index - b.index);
+  pinEnd.sort((a, b) => a.index - b.index);
 
-  // Sort rest by score descending for edges-first placement
-  rest.sort((a, b) => b.score - a.score);
+  // Float items: edges-first placement by score
+  float.sort((a, b) => b.score - a.score);
+  const floatBeginning: ContextItem[] = [];
+  const floatMiddle: ContextItem[] = [];
 
-  // Edges-first: alternate between beginning and pre-history positions
-  const beginning: ContextItem[] = [];
-  const middle: ContextItem[] = [];
-
-  for (let i = 0; i < rest.length; i++) {
+  for (let i = 0; i < float.length; i++) {
     if (i % 2 === 0) {
-      beginning.push(rest[i]!);
+      floatBeginning.push(float[i]!);
     } else {
-      middle.push(rest[i]!);
+      floatMiddle.push(float[i]!);
     }
   }
-  // Reverse middle so lower-scored items are toward the center
-  middle.reverse();
+  // Reverse middle so lowest-scored items cluster at the center
+  floatMiddle.reverse();
 
   const result: PackedItem[] = [];
 
   const push = (arr: ContextItem[], placement: Placement) => {
     for (const item of arr) {
-      result.push({
+      const packed: PackedItem = {
         id: item.id,
         source: item.source,
         content: item.content,
@@ -58,14 +57,18 @@ export function applyPlacement(items: ContextItem[]): PackedItem[] {
         tokens: item.tokens,
         score: item.score,
         placement,
-      });
+      };
+      if (item.role != null) {
+        packed.role = item.role;
+      }
+      result.push(packed);
     }
   };
 
-  push(system, 'beginning');
-  push(beginning, 'beginning');
-  push(middle, 'middle');
-  push(history, 'end');
+  push(pinStart, 'beginning');
+  push(floatBeginning, 'beginning');
+  push(floatMiddle, 'middle');
+  push(pinEnd, 'end');
   push(query, 'end');
 
   return result;

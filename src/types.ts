@@ -4,9 +4,6 @@ export type Priority = 'required' | 'high' | 'medium' | 'low';
 /** Strategy for handling items that don't fit the budget. */
 export type DropStrategy = 'relevance' | 'oldest' | 'none';
 
-/** Strategy for compressing items to reclaim token budget. */
-export type CompressStrategy = 'truncate' | 'summarize-oldest' | 'none';
-
 /** Position in the packed context (for lost-in-the-middle optimization). */
 export type Placement = 'beginning' | 'middle' | 'end';
 
@@ -32,6 +29,16 @@ export interface OptimizerConfig {
   reserveOutput?: number;
   /** Optional custom tokenizer. Falls back to a heuristic estimator. */
   tokenizer?: Tokenizer;
+  /**
+   * Custom pricing for cost estimation. Overrides the built-in pricing table.
+   * Useful for fine-tuned models, private deployments, or when prices change.
+   */
+  pricing?: {
+    /** Cost in USD per 1 million input tokens. */
+    inputPer1M: number;
+    /** Provider name (e.g. 'anthropic', 'openai'). Defaults to 'custom'. */
+    provider?: string;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -41,12 +48,40 @@ export interface OptimizerConfig {
 export interface AddOptions {
   /** Priority tier. 'required' items are always included. */
   priority: Priority;
-  /** How to handle items that don't fit. Default: 'relevance'. */
+  /**
+   * How to handle items that don't fit the budget.
+   *
+   * - `'relevance'` (default) — drop lowest-scored items first.
+   * - `'oldest'` — drop oldest items first (applies recency bias so newer items
+   *   score higher). Good for conversation history.
+   * - `'none'` — never drop items from this source. All items are treated as
+   *   required for packing purposes.
+   */
   dropStrategy?: DropStrategy;
-  /** How to compress items when budget is tight. Default: 'none'. */
-  compressStrategy?: CompressStrategy;
   /** For ordered sources (history): keep the last N items as required. */
   keepLast?: number;
+  /**
+   * Group items into conversation turns before packing.
+   *
+   * - `'turn'` — Group consecutive messages into turns. A new turn starts at
+   *   each `role: 'user'` message. Each turn becomes a single ContextItem that
+   *   is packed/dropped atomically. `keepLast` counts turns, not messages.
+   *
+   * Items without `role` fields are left ungrouped.
+   */
+  groupBy?: 'turn';
+  /**
+   * Pin items from this source to the beginning or end of the packed context.
+   *
+   * - `'beginning'` — place before floating items (good for system prompts,
+   *   critical instructions).
+   * - `'end'` — place after floating items (good for conversation history,
+   *   recent context).
+   *
+   * Items without a position are "floating" and arranged using the
+   * lost-in-the-middle optimization (highest-scored at edges, lowest in middle).
+   */
+  position?: 'beginning' | 'end';
   /** Custom scoring function. Receives each item and the query. */
   scorer?: (item: ContextItem, query: string) => number;
   /**
@@ -82,6 +117,10 @@ export interface ContextItem {
   score: number;
   /** Original position index within its source. */
   index: number;
+  /** Placement hint: pin to beginning or end, or float (default). */
+  position?: 'beginning' | 'end';
+  /** Message role (e.g. 'user', 'assistant', 'system'). Extracted from input objects. */
+  role?: string;
 }
 
 /** A registered context source. */
@@ -115,6 +154,8 @@ export interface PackedItem {
   tokens: number;
   score: number;
   placement: Placement;
+  /** Message role (e.g. 'user', 'assistant', 'system'). Present when the input had a `role` field. */
+  role?: string;
 }
 
 // ---------------------------------------------------------------------------

@@ -37,14 +37,31 @@ Zero dependencies. Works with any provider.
 
 ## The problem
 
-Bigger context windows don't make your LLM smarter. They often make it worse.
+Here's what happens when you naively pack an LLM context — system prompt, 12 tools, 30-message history, and 15 RAG chunks into a 1,600 token budget:
+
+```
+                              NAIVE              SNUG
+─────────────────────────── ──────────────────── ──────────────────
+Recent history preserved?    No (truncated)       Yes (atomic turns)
+High-relevance RAG included  0/3                  3/3
+Items in attention dead zone 9                    0 high-value
+Tool count                   12                   12
+Placement strategy           Sequential           Edges-first (U-curve)
+Drop strategy                Cut at end           Score-based
+```
+
+The naive approach fills the window top-to-bottom and cuts when full. The most recent messages — the ones the model needs most — are the first to go. High-relevance RAG chunks never make it in. History messages get buried in the middle of the context where the model barely attends to them.
+
+This isn't a theoretical problem. Research quantifies it:
 
 - **Lost in the Middle** (Liu et al., TACL 2024) — LLMs follow a U-shaped attention curve. The middle of context is effectively ignored. Performance degrades **30%+** based purely on position.
 - **Context Distraction** (Gemini 2.5 tech report) — Beyond ~100K tokens, models over-focus on context and neglect their training knowledge.
 - **Tool Overload** (Berkeley Function-Calling Leaderboard) — Every model performs worse with more tools. Llama 3.1 8b failed with 46 tools, succeeded with 19.
 - **Context Clash** (Microsoft/Salesforce) — Multi-turn context caused a **39% average performance drop**. o3 went from 98.1 to 64.1.
 
-You're already managing this by hand — trimming history, picking which RAG chunks to include, hoping the important stuff lands where the model pays attention. snug does it systematically.
+snug fixes this by scoring every item, packing by priority, and placing high-value content at the edges of the context window where attention is strongest.
+
+> Run `bun examples/10-before-after.ts` to see the full comparison, or `bun examples/11-visualize-context.ts` to see the U-shaped attention map for your context.
 
 ---
 
@@ -58,7 +75,18 @@ Every `pack()` call runs five stages:
 
 **Pack** — Greedy knapsack. Required items always go in. Remaining budget fills by score. Everything that doesn't fit is tracked with reasons.
 
-**Place** — Rearrange based on the U-shaped attention curve. System prompt at the start. Recent history at the end. High-value items at the edges. Low-value items in the middle where attention is weakest.
+**Place** — Rearrange based on the U-shaped attention curve. High-value items land at the edges where attention is strongest. Low-value items go in the middle:
+
+```
+Attention
+100%|█                                  █      ← system prompt, recent history, query
+    |████                            ████
+    |████████                    ████████
+    |██████████████      ████████████████
+ 30%|████████████████████████████████████      ← low-priority items here
+    +------------------------------------
+    START              MID              END
+```
 
 **Report** — Full breakdown of what happened:
 
